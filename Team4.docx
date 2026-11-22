@@ -1,0 +1,115 @@
+
+
+## 1. Wrong product image on search cards (Medium, UI / data mapping)
+
+**Before** (`server/src/services/product.service.js`)
+```js
+if (typeof query.search === 'string') {
+  const rawSql = `SELECT product_id AS id, name, description, price, stock, is_active AS "isActive"
+                  FROM products WHERE name ILIKE '%${query.search}%' AND is_active = true`;
+  const rawProducts = await prisma.$queryRawUnsafe(rawSql);
+  return { data: rawProducts, ... };
+}
+```
+**After**
+```js
+const searchTerm = [query.search, query.q].find((v) => typeof v === 'string' && v.trim());
+if (searchTerm) {
+  where.OR = [
+    { name: { contains: searchTerm.trim(), mode: 'insensitive' } },
+    { description: { contains: searchTerm.trim(), mode: 'insensitive' } },
+  ];
+}
+// ...same prisma.product.findMany({ where, include: productInclude }) as normal listing (images included)
+```
+The raw-SQL `ORDER BY ${query.sort}` branch was also removed (SQL injection). The `minRating` filter sent by the UI is now honoured.
+
+## 2. Reading other customers' orders via `userId` (Critical, IDOR)
+**Before** (`order.service.js`)
+```js
+const where = { ...query };
+if (!where.userId && !where.user) where.userId = userId;   // attacker supplies userId
+return prisma.order.findMany({ where, ... });
+// getOrder: prisma.order.findFirst({ where: { orderNumber: number } })   // no owner check
+```
+**After**
+```js
+const where = { userId };                       // always the authenticated user
+if (typeof query.status === 'string' && query.status) where.orderStatus = query.status;
+// getOrder: where: { orderNumber: number, userId }
+```
+Client-supplied filters are no longer spread into the Prisma query, and single-order lookup is also scoped to the owner.
+
+## 3. No HTTPS + misleading HSTS header (High)
+**Cause:** Helmet sent `Strict-Transport-Security` on a plain-HTTP site, and nothing redirected to HTTPS.
+**After** (`server.js`)
+```js
+const forceHttps = process.env.FORCE_HTTPS === 'true';
+if (forceHttps) app.use((req, res, next) => req.secure || req.path === '/api/health'
+  ? next() : res.redirect(301, `https://${req.headers.host}${req.originalUrl}`));
+app.use(helmet({ hsts: forceHttps ? { maxAge: 15552000, includeSubDomains: true } : false, ... }));
+```
+HSTS is now only sent when HTTPS is really in use; with `FORCE_HTTPS=true` HTTP is redirected to HTTPS and the auth cookie is `Secure`.
+**Deployment note:** the Node app does not hold certificates. Terminate TLS in front of it (Caddy / nginx + Let's Encrypt, or the cloud load balancer), forward `X-Forwarded-Proto`, open port 443, and set `FORCE_HTTPS=true`. (`trust proxy` is already enabled.) Note that Let's Encrypt needs a real domain name, and nip.io hosts work for this.
+
+## 4. Auth token in localStorage (Medium)
+**Before** (`AuthContext.jsx`, `client.js`)
+```js
+localStorage.setItem('vibe2fix_token', receivedToken);
+config.headers.Authorization = `Bearer ${localStorage.getItem('vibe2fix_token')}`;
+```
+**After:** the server sets the token in an **httpOnly, SameSite=Strict (and Secure over HTTPS) cookie**; JavaScript can no longer read it, so XSS can't steal it.
+```js
+// auth.controller.js
+res.cookie('vibe2fix_token', token, { httpOnly: true, sameSite: 'strict',
+  secure: req.secure || process.env.FORCE_HTTPS === 'true', maxAge: 7*24*3600*1000, path: '/' });
+// requireAuth.js: token = Bearer header || req.cookies.vibe2fix_token
+// client.js: axios withCredentials: true; no localStorage access
+// new POST /api/auth/logout clears the cookie; AuthContext restores the session via GET /api/auth/me
+```
+The client-supplied `x-trace-session-ref` header (which also exposed other users' carts) is no longer honoured by the server.
+
+## 5. Password-reset token only printed to the console (High)
+**Before:** the link was only `console.log`ged, and only when `NODE_ENV !== 'production'`. In production nothing was delivered at all.
+**After** (`utils/mailer.js`, `auth.service.js`): the link is e-mailed with nodemailer (`SMTP_*` env vars). Delivery errors are swallowed so the response never reveals whether an account exists. Without SMTP configured, the mail is written to the server log as a fallback. The link base URL comes from `PUBLIC_URL`, not the request Host header (prevents reset-link poisoning). The UI text no longer tells users to look at the server console.
+
+## 6. Self-promotion to admin via profile update (Critical)
+**Before** (`auth.service.js`)
+```js
+const merged = deepMerge({}, updateData);              // also prototype-pollutable
+if (merged.role !== undefined) data.role = String(merged.role).trim();
+```
+**After**
+```js
+// allow-list: only name and phone
+if (input.name !== undefined) data.name = String(input.name).trim();
+if (input.phone !== undefined) data.phone = String(input.phone).trim();
+```
+`role` (and any other field) can no longer be set through `PUT /api/auth/me|profile`; `deepMerge` is no longer used.
+
+## 7. Mismatched review counts & static 5-star rating (Medium)
+**Cause:** the seed hard-coded `avgRating: 4.8, reviewCount: 12`, etc. for products that had **no** reviews, and the detail page header used a different number than the reviews listed. Counting also included Flagged reviews that the page hides.
+**After:** seed data starts at 0; the seed recomputes `avgRating`/`reviewCount` from real Active reviews on every start (fixes existing databases); `recalculateProductRating` and `getProductById` use the same "Active reviews" set; the section heading uses the same `reviewCount` as the header. Product detail no longer returns internal `costPrice` / `supplierEmail`.
+
+## 8. Redirect to empty cart after placing an order (High)
+**Before** (`CheckoutPage.jsx`)
+```js
+await refreshCart();                         // cart is now empty -> re-render ...
+navigate(`/order-success/${order.orderNumber}`);
+...
+if (items.length === 0 && !loading) { navigate('/cart'); return null; }   // ...which fires first
+```
+**After:** an `orderPlacedRef` is set before navigating, the cart refresh runs after navigation, and the empty-cart redirect moved into a `useEffect` that is skipped once an order was placed.
+
+## 9. Dead link on homepage hero button (Low)
+**Before:** `<Link to="/products/prod-aud-01">` (an ID that does not exist; product IDs are UUIDs).
+**After** (`ParticleHero.jsx`): the real flagship product is looked up from the API and linked by its actual ID (falls back to `/products`).
+
+## 10. Empty "IoT & Microcontrollers" category (Low)
+**Cause:** the footer links to `?category=iot-development`, but no such category existed.
+**After** (`seed.js`): added the `IoT & Microcontrollers` (`iot-development`) category and two products (ESP32-S3 board, RP2040 starter kit).
+
+## 11. Uncompressed 527 KB JavaScript bundle (Low)
+**After** (`server.js`): `app.use(compression())` (npm `compression`). Static JS/CSS/JSON is now gzip-compressed (~70-75% smaller on the wire).
+
+
